@@ -11,5 +11,5 @@ services:
       - POLL_INTERVAL=60
       - ROLLING_WINDOW_MIN=30
       - DRIFT_PER_HOUR=0.03
-      # WICHTIG: vor dem ersten Start aendern! Siehe .env / README.
+      # IMPORTANT: change before first run! See .env / README.
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme-in-env}

@@ -1,15 +1,15 @@
 """
-Crew-Tracking: Garmin LiveTrack -> ETA-Dashboards fuer Support-Crew.
+crew-eta: Garmin LiveTrack -> ETA dashboards for a support crew.
 
-Mehr-Track-Modell:
-- /tracking/admin  : passwortgeschuetzt, Tracks anlegen/bearbeiten/loeschen
-- /tracking/       : Liste aller Tracks; Tracks ohne Garmin-Link haben ein
-                     Eingabefeld ("Link eingeben"), das der erste Nutzer ausfuellt
-- /tracking/t/<id> : Dashboard eines Tracks (Karte + ETA), inkl. Button zum
-                     Aendern des Garmin-Links
+Multi-track model:
+- /tracking/admin  : password-protected; create / edit / delete tracks
+- /tracking/       : list of all tracks; a track without a Garmin link shows an
+                     inline "enter link" field that the first visitor fills in
+- /tracking/t/<id> : one track's dashboard (map + ETA), incl. a button to
+                     change the Garmin link
 
-ETA je VP: hoehenkorrigierte Aequivalenzdistanz (Minetti-artig), Blend aus
-rollierendem Fenster und Gesamtpace, plus leichter Ermuedungsdrift.
+Per-VP ETA: grade-adjusted equivalent distance (Minetti-style), a blend of a
+rolling window and overall pace, plus a small fatigue drift.
 """
 
 import asyncio
@@ -30,7 +30,7 @@ from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException,
 from fastapi.responses import HTMLResponse, JSONResponse
 
 # ----------------------------------------------------------------------------
-# Konfiguration
+# Configuration
 # ----------------------------------------------------------------------------
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
@@ -52,7 +52,7 @@ STATE = {"tracks": {}}
 LOCK = asyncio.Lock()
 
 # ----------------------------------------------------------------------------
-# Geometrie & GAP
+# Geometry & grade-adjusted pace
 # ----------------------------------------------------------------------------
 def haversine(lat1, lon1, lat2, lon2):
     r = 6371000.0
@@ -64,6 +64,8 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def grade_factor(g):
+    """Pace multiplier vs. flat (Minetti-style, tuned for trail).
+    +10% uphill ~1.4x, +20% ~2.1x, -10% ~0.9x, steep downhill slow again."""
     g = max(-0.35, min(0.35, g))
     m = 1.0 + 2.6 * g + 15.0 * g * g
     return max(0.7, min(4.0, m))
@@ -79,12 +81,13 @@ def build_route(gpx_bytes):
         for rte in gpx.routes:
             pts.extend(rte.points)
     if len(pts) < 2:
-        raise ValueError("GPX enthaelt keine Strecke")
+        raise ValueError("GPX contains no route")
 
     lat = [p.latitude for p in pts]
     lon = [p.longitude for p in pts]
     ele_raw = [p.elevation if p.elevation is not None else 0.0 for p in pts]
 
+    # Smooth elevation (moving average) so the gradient doesn't jitter
     w = 7
     ele = []
     for i in range(len(ele_raw)):
@@ -118,6 +121,8 @@ def idx_at_km(route, km):
 
 
 def project(route, lat, lon, last_idx):
+    """Project a position onto the route. Searches forward from the last known
+    index so crossings/switchbacks don't snap backwards."""
     n = len(route["lat"])
     start = max(0, last_idx - 150)
     end = min(n, last_idx + 4000)
@@ -127,13 +132,14 @@ def project(route, lat, lon, last_idx):
         if d < best_d:
             best_d, best_i = d, i
     if best_d > OFFROUTE_MAX_M:
+        # global fallback search (e.g. restart mid-race)
         for i in range(0, n, 5):
             d = haversine(lat, lon, route["lat"][i], route["lon"][i])
             if d < best_d:
                 best_d, best_i = d, i
         if best_d > OFFROUTE_MAX_M:
             return None
-    return max(best_i, last_idx)
+    return max(best_i, last_idx)  # keep progress monotonic
 
 
 # ----------------------------------------------------------------------------
@@ -142,7 +148,7 @@ def project(route, lat, lon, last_idx):
 def parse_livetrack_url(url):
     m = re.search(r"livetrack\.garmin\.com/session/([0-9a-fA-F-]+)", url)
     if not m:
-        raise ValueError("Kein gueltiger LiveTrack-Link (erwartet .../session/<id>/...)")
+        raise ValueError("Not a valid LiveTrack link (expected .../session/<id>/...)")
     sid = m.group(1)
     tok = None
     mt = re.search(r"/token/([A-Za-z0-9_-]+)", url)
@@ -194,11 +200,11 @@ async def fetch_trackpoints(sid, tok):
                 last_err = f"HTTP {r.status_code}"
             except Exception as e:  # noqa: BLE001
                 last_err = str(e)
-    raise RuntimeError(last_err or "LiveTrack nicht erreichbar")
+    raise RuntimeError(last_err or "LiveTrack unreachable")
 
 
 # ----------------------------------------------------------------------------
-# ETA-Engine (pro Track)
+# ETA engine (per track)
 # ----------------------------------------------------------------------------
 def new_track(cfg, route):
     return {"cfg": cfg, "route": route, "track": [], "history": [],
@@ -242,6 +248,7 @@ def ingest_points(tr, points):
 
 
 def eq_speed_now(tr):
+    """Equivalent speed (eq-m/s): blend of rolling window and overall pace."""
     hist = tr["history"]
     route = tr["route"]
     if len(hist) < 2:
@@ -266,7 +273,7 @@ def eq_speed_now(tr):
 
     w = min(1.0, span / win) * 0.75
     v = w * v_roll + (1 - w) * v_overall
-    if v < 0.05:
+    if v < 0.05:  # essentially stopped (VP break) -> anchor to overall pace
         v = max(v_overall, 0.05)
     return v, v_roll, v_overall
 
@@ -299,7 +306,7 @@ def build_status(tr):
 
     markers = list(cfg["markers"])
     if not any(abs(m["km"] * 1000 - route["total_m"]) < 200 for m in markers):
-        markers.append({"name": "Ziel", "km": round(route["total_m"] / 1000.0, 1)})
+        markers.append({"name": "Finish", "km": round(route["total_m"] / 1000.0, 1)})
 
     i_now = tr["history"][-1][1] if tr["history"] else 0
     eq_now = route["eq"][i_now]
@@ -328,7 +335,7 @@ def build_status(tr):
 
 
 def build_summary(tr):
-    """Kompakter Stand fuer die Uebersichtsliste."""
+    """Compact status for the overview list."""
     cfg = tr["cfg"]
     s = {"id": cfg["id"], "name": cfg["name"],
          "needs_link": not (cfg.get("session_id") or cfg.get("simulate")),
@@ -347,7 +354,7 @@ def build_summary(tr):
 
 
 # ----------------------------------------------------------------------------
-# Persistenz
+# Persistence
 # ----------------------------------------------------------------------------
 def gpx_path(tid):
     return DATA_DIR / f"{tid}.gpx"
@@ -386,9 +393,10 @@ def load_all():
 
 
 # ----------------------------------------------------------------------------
-# Poller (+ Simulator)
+# Poller (+ simulator)
 # ----------------------------------------------------------------------------
 def simulate_points(tr):
+    """Fake runner: ~9 min/eq-km from setup time, one point per poll."""
     route = tr["route"]
     t0 = tr["cfg"]["created"]
     now = time.time()
@@ -445,12 +453,12 @@ async def _startup():
 
 
 # ----------------------------------------------------------------------------
-# Auth (Admin, HTTP Basic)
+# Auth (admin, HTTP Basic)
 # ----------------------------------------------------------------------------
 def require_admin(authorization: str = Header(None)):
     unauth = HTTPException(
-        401, detail="Anmeldung erforderlich",
-        headers={"WWW-Authenticate": 'Basic realm="Crew-Tracking Admin"'})
+        401, detail="Authentication required",
+        headers={"WWW-Authenticate": 'Basic realm="crew-eta admin"'})
     if not authorization or not authorization.lower().startswith("basic "):
         raise unauth
     try:
@@ -474,31 +482,31 @@ def parse_markers(text):
             continue
         parts = re.split(r"[,;]\s*|\s+", line, maxsplit=1)
         if len(parts) != 2:
-            raise ValueError(f"Zeile nicht lesbar: '{line}' (Format: VP1, 12.0)")
+            raise ValueError(f"Cannot read line: '{line}' (format: VP1, 12.0)")
         name, km_s = parts[0], parts[1]
         try:
             km = float(km_s.replace(",", "."))
         except ValueError:
-            try:
+            try:  # maybe swapped: "12.0 VP1"
                 km = float(name.replace(",", "."))
                 name = km_s
             except ValueError:
-                raise ValueError(f"km-Angabe nicht lesbar in: '{line}'")
+                raise ValueError(f"Cannot read km value in: '{line}'")
         markers.append({"name": name.strip(), "km": km})
     if not markers:
-        raise ValueError("Keine Marker angegeben")
+        raise ValueError("No markers given")
     return sorted(markers, key=lambda m: m["km"])
 
 
 def get_track(tid):
     tr = STATE["tracks"].get(tid)
     if not tr:
-        raise HTTPException(404, "Track nicht gefunden")
+        raise HTTPException(404, "Track not found")
     return tr
 
 
 # ----------------------------------------------------------------------------
-# Admin-API (Basic-Auth via Depends)
+# Admin API (Basic auth via Depends)
 # ----------------------------------------------------------------------------
 @app.post("/tracking/admin/api/create")
 async def admin_create(
@@ -510,7 +518,7 @@ async def admin_create(
 ):
     name = name.strip()
     if not name:
-        raise HTTPException(400, "Name fehlt")
+        raise HTTPException(400, "Name is required")
     sim = simulate in ("1", "on", "true")
     gpx_bytes = await gpx.read()
     try:
@@ -521,8 +529,8 @@ async def admin_create(
     total_km = route["total_m"] / 1000.0
     for m in mks:
         if m["km"] > total_km + 1:
-            raise HTTPException(400, f"{m['name']} bei km {m['km']} liegt hinter "
-                                     f"dem Streckenende ({total_km:.1f} km)")
+            raise HTTPException(400, f"{m['name']} at km {m['km']} is past the "
+                                     f"end of the route ({total_km:.1f} km)")
     tid = secrets.token_hex(4)
     cfg = {"id": tid, "name": name, "markers": mks, "simulate": sim,
            "livetrack_url": None, "session_id": None, "token": None,
@@ -547,14 +555,14 @@ async def admin_update(
     async with LOCK:
         tr = STATE["tracks"].get(id)
         if not tr:
-            raise HTTPException(404, "Track nicht gefunden")
+            raise HTTPException(404, "Track not found")
         try:
             mks = parse_markers(markers)
         except ValueError as e:
             raise HTTPException(400, str(e))
         name = name.strip()
         if not name:
-            raise HTTPException(400, "Name fehlt")
+            raise HTTPException(400, "Name is required")
         new_gpx = None
         if gpx is not None:
             new_gpx = await gpx.read()
@@ -564,14 +572,14 @@ async def admin_update(
             except ValueError as e:
                 raise HTTPException(400, str(e))
             gpx_path(id).write_bytes(new_gpx)
-            # Strecke geaendert -> Live-Zustand verwerfen (Projektion ungueltig)
+            # route changed -> discard live state (projection invalid)
             tr = new_track(tr["cfg"], route)
             STATE["tracks"][id] = tr
         total_km = tr["route"]["total_m"] / 1000.0
         for m in mks:
             if m["km"] > total_km + 1:
-                raise HTTPException(400, f"{m['name']} bei km {m['km']} liegt hinter "
-                                         f"dem Streckenende ({total_km:.1f} km)")
+                raise HTTPException(400, f"{m['name']} at km {m['km']} is past the "
+                                         f"end of the route ({total_km:.1f} km)")
         tr["cfg"]["name"] = name
         tr["cfg"]["markers"] = mks
         tr["cfg"]["simulate"] = simulate in ("1", "on", "true")
@@ -608,7 +616,7 @@ async def admin_tracks(_ok: bool = Depends(require_admin)):
 
 
 # ----------------------------------------------------------------------------
-# Oeffentliche API
+# Public API
 # ----------------------------------------------------------------------------
 @app.get("/tracking/api/tracks")
 async def api_tracks():
@@ -620,7 +628,7 @@ async def api_tracks():
 
 @app.post("/tracking/api/link")
 async def api_link(id: str = Form(...), livetrack: str = Form(...)):
-    """Garmin-Link setzen/aendern — bewusst ohne Login (erster Nutzer traegt ein)."""
+    """Set/change the Garmin link — intentionally open (first visitor fills it)."""
     try:
         sid, tok = parse_livetrack_url(livetrack)
     except ValueError as e:
@@ -628,12 +636,12 @@ async def api_link(id: str = Form(...), livetrack: str = Form(...)):
     async with LOCK:
         tr = STATE["tracks"].get(id)
         if not tr:
-            raise HTTPException(404, "Track nicht gefunden")
+            raise HTTPException(404, "Track not found")
         changed = tr["cfg"].get("session_id") != sid
         tr["cfg"]["livetrack_url"] = livetrack
         tr["cfg"]["session_id"] = sid
         tr["cfg"]["token"] = tok
-        if changed:  # anderer Link -> Live-Daten zuruecksetzen
+        if changed:  # different link -> reset live data
             tr["track"] = []
             tr["history"] = []
             tr["last_idx"] = 0
@@ -672,7 +680,7 @@ async def healthz():
 
 
 # ----------------------------------------------------------------------------
-# Seiten
+# Pages
 # ----------------------------------------------------------------------------
 @app.get("/tracking", response_class=HTMLResponse)
 @app.get("/tracking/", response_class=HTMLResponse)
@@ -727,11 +735,11 @@ button.danger{background:#3a2226;color:var(--red)}
 .dim{color:var(--dim)}
 """
 
-# ---------- Liste ----------
-LIST_HTML = """<!doctype html><html lang="de"><head>
+# ---------- List ----------
+LIST_HTML = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Crew-Tracking</title>
+<title>crew-eta</title>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>""" + COMMON_CSS + """
 .trk{display:flex;justify-content:space-between;align-items:center;gap:12px;
@@ -744,39 +752,39 @@ LIST_HTML = """<!doctype html><html lang="de"><head>
 .linkbox input{flex:1}
 .empty{color:var(--dim);padding:24px 4px}
 </style></head><body>
-<header><h1>Crew-Tracking</h1><span class="sub">Live-Verfolgung</span></header>
-<div class="wrap"><div class="card" id="list"><div class="empty">lade …</div></div>
-<div class="dim" style="font-size:12px">Tracks anlegen im <a href="/tracking/admin">Admin-Bereich</a></div>
+<header><h1>crew-eta</h1><span class="sub">live tracking</span></header>
+<div class="wrap"><div class="card" id="list"><div class="empty">loading …</div></div>
+<div class="dim" style="font-size:12px">Create tracks in the <a href="/tracking/admin">admin area</a></div>
 </div>
 <script>
-const fmtClock=e=>new Date(e*1000).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});
+const fmtClock=e=>new Date(e*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 async function load(){
   let d;try{d=await(await fetch('/tracking/api/tracks')).json()}catch{return}
   const box=document.getElementById('list');
-  if(!d.tracks.length){box.innerHTML='<div class="empty">Noch keine Tracks. Lege einen im <a href="/tracking/admin">Admin-Bereich</a> an.</div>';return}
+  if(!d.tracks.length){box.innerHTML='<div class="empty">No tracks yet. Create one in the <a href="/tracking/admin">admin area</a>.</div>';return}
   box.innerHTML='';
   for(const t of d.tracks){
     const row=document.createElement('div');row.className='trk';
     if(t.needs_link){
       row.innerHTML=`<div style="width:100%">
         <div class="name">${esc(t.name)}</div>
-        <div class="meta">${t.total_km} km · Garmin-LiveTrack-Link fehlt</div>
+        <div class="meta">${t.total_km} km · Garmin LiveTrack link missing</div>
         <div class="linkbox">
-          <input placeholder="Garmin-LiveTrack-Link hier einfügen" data-id="${t.id}">
-          <button data-set="${t.id}">Speichern</button>
+          <input placeholder="Paste Garmin LiveTrack link here" data-id="${t.id}">
+          <button data-set="${t.id}">Save</button>
         </div>
         <div class="msg" data-msg="${t.id}"></div>
       </div>`;
     }else{
       let meta=`${t.total_km} km`;
       if(t.simulate)meta+=' · SIMULATION';
-      if(t.runner_km!=null)meta+=` · bei km ${t.runner_km.toFixed(1)}`;
+      if(t.runner_km!=null)meta+=` · at km ${t.runner_km.toFixed(1)}`;
       if(t.next)meta+=` · ${esc(t.next.name)} ~${fmtClock(t.next.eta_epoch)}`;
       if(t.poll_error)meta+=` · ⚠ ${esc(t.poll_error)}`;
       row.innerHTML=`<div>
         <div class="name"><a href="/tracking/t/${t.id}">${esc(t.name)}</a></div>
         <div class="meta">${meta}</div></div>
-        <div class="go"><a href="/tracking/t/${t.id}"><button>öffnen →</button></a></div>`;
+        <div class="go"><a href="/tracking/t/${t.id}"><button>open →</button></a></div>`;
     }
     box.appendChild(row);
   }
@@ -787,7 +795,7 @@ async function load(){
     const fd=new FormData();fd.set('id',id);fd.set('livetrack',inp.value.trim());
     const r=await fetch('/tracking/api/link',{method:'POST',body:fd});
     if(r.ok){location.href='/tracking/t/'+id}
-    else{const e=await r.json().catch(()=>({}));msg.textContent=e.detail||'Fehler';msg.className='msg err'}
+    else{const e=await r.json().catch(()=>({}));msg.textContent=e.detail||'Error';msg.className='msg err'}
   }));
 }
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -796,10 +804,10 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden)load()});
 </script></body></html>"""
 
 # ---------- Dashboard ----------
-DASH_HTML = """<!doctype html><html lang="de"><head>
+DASH_HTML = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Crew-Tracking</title>
+<title>crew-eta</title>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <style>""" + COMMON_CSS + """
@@ -821,20 +829,20 @@ tr.passed .nm::after{content:" ✓";color:var(--green)}
 .linkrow{display:flex;gap:8px;margin-top:10px}.linkrow input{flex:1}
 .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
 </style></head><body>
-<header><h1><a href="/tracking/">Crew-Tracking</a></h1><span class="sub" id="hdr">lade …</span></header>
+<header><h1><a href="/tracking/">crew-eta</a></h1><span class="sub" id="hdr">loading …</span></header>
 <div class="wrap">
   <div id="needlink" class="card" style="display:none">
-    <b>Garmin-LiveTrack-Link fehlt.</b>
-    <div class="dim" style="font-size:13px;margin-top:4px">Bitte den Link aus Garmin (nach Aktivitätsstart) einfügen — danach läuft die Verfolgung automatisch.</div>
+    <b>Garmin LiveTrack link missing.</b>
+    <div class="dim" style="font-size:13px;margin-top:4px">Paste the link from Garmin (available once the activity has started) — tracking then runs automatically.</div>
     <div class="linkrow"><input id="link1" placeholder="https://livetrack.garmin.com/session/…/token/…">
-      <button id="save1">Speichern</button></div>
+      <button id="save1">Save</button></div>
     <div class="msg" id="msg1"></div>
   </div>
   <div id="live" style="display:none">
     <div id="map"></div>
     <div class="status" id="stat"></div>
     <div class="card next" id="nextcard" style="display:none">
-      <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)">Nächster Punkt</div>
+      <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)">Next point</div>
       <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-top:6px">
         <span class="nm" id="n_name" style="font-size:22px"></span>
         <span class="eta mono" id="n_eta"></span>
@@ -842,13 +850,13 @@ tr.passed .nm::after{content:" ✓";color:var(--green)}
       </div>
     </div>
     <div class="card">
-      <table><thead><tr><th>Punkt</th><th>km</th><th>verbleibend</th><th>ETA</th></tr></thead>
+      <table><thead><tr><th>Point</th><th>km</th><th>remaining</th><th>ETA</th></tr></thead>
       <tbody id="rows"></tbody></table>
       <div class="toolbar">
-        <button class="ghost" id="editlink">Garmin-Link ändern</button>
+        <button class="ghost" id="editlink">Change Garmin link</button>
         <div id="editbox" style="display:none;flex:1;min-width:240px">
-          <div class="linkrow"><input id="link2" placeholder="Neuer LiveTrack-Link">
-            <button id="save2">Übernehmen</button></div>
+          <div class="linkrow"><input id="link2" placeholder="New LiveTrack link">
+            <button id="save2">Apply</button></div>
           <div class="msg" id="msg2"></div>
         </div>
       </div>
@@ -858,7 +866,7 @@ tr.passed .nm::after{content:" ✓";color:var(--green)}
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const TID=location.pathname.split('/').filter(Boolean).pop();
-const fmtClock=e=>new Date(e*1000).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});
+const fmtClock=e=>new Date(e*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 const fmtCd=s=>{if(s<0)s=0;const h=Math.floor(s/3600),m=Math.round(s%3600/60);
   return h>0?`in ${h} h ${m} min`:`in ${m} min`};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
@@ -866,10 +874,10 @@ function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','
 async function saveLink(inputEl,msgEl){
   const fd=new FormData();fd.set('id',TID);fd.set('livetrack',inputEl.value.trim());
   const r=await fetch('/tracking/api/link',{method:'POST',body:fd});
-  if(r.ok){msgEl.textContent='Gespeichert';msgEl.className='msg ok';
+  if(r.ok){msgEl.textContent='Saved';msgEl.className='msg ok';
     mapReady=false;if(map){map.remove();map=null;runnerMarker=null}
     setTimeout(refresh,300)}
-  else{const e=await r.json().catch(()=>({}));msgEl.textContent=e.detail||'Fehler';msgEl.className='msg err'}
+  else{const e=await r.json().catch(()=>({}));msgEl.textContent=e.detail||'Error';msgEl.className='msg err'}
 }
 document.getElementById('save1').addEventListener('click',()=>
   saveLink(document.getElementById('link1'),document.getElementById('msg1')));
@@ -895,9 +903,9 @@ const runnerIcon=L.divIcon({className:'',iconSize:[18,18],
   html:'<div style="width:16px;height:16px;border-radius:50%;background:#f5a623;border:3px solid #101418;box-shadow:0 0 10px #f5a623"></div>'});
 
 async function refresh(){
-  let d;try{const rr=await fetch('/tracking/api/status/'+TID);if(rr.status===404){document.getElementById('hdr').textContent='Track nicht gefunden';return}d=await rr.json()}catch{return}
+  let d;try{const rr=await fetch('/tracking/api/status/'+TID);if(rr.status===404){document.getElementById('hdr').textContent='Track not found';return}d=await rr.json()}catch{return}
   document.getElementById('hdr').textContent=`${esc(d.name)} · ${d.total_km} km${d.simulate?' · SIMULATION':''}`;
-  document.title=d.name+' · Crew-Tracking';
+  document.title=d.name+' · crew-eta';
   if(d.needs_link){
     document.getElementById('needlink').style.display='block';
     document.getElementById('live').style.display='none';return;
@@ -909,10 +917,10 @@ async function refresh(){
   const st=document.getElementById('stat');let s='';
   if(d.runner){
     s+=`<span>Position <b>km ${d.runner.km.toFixed(1)}</b> · ${d.runner.ele} m</span>`;
-    s+=`<span>Update vor <b>${d.runner.stale_min<1?'&lt;1':Math.round(d.runner.stale_min)} min</b></span>`;
-    if(d.pace&&d.pace.rolling_min_per_eqkm)s+=`<span>GAP-Pace <b>${d.pace.rolling_min_per_eqkm} min/km</b></span>`;
-    if(d.runner.stale_min>10)s+=`<span class="warn">⚠ Signal seit ${Math.round(d.runner.stale_min)} min stale</span>`;
-  }else s+='<span>Warte auf erste LiveTrack-Daten …</span>';
+    s+=`<span>Updated <b>${d.runner.stale_min<1?'&lt;1':Math.round(d.runner.stale_min)} min</b> ago</span>`;
+    if(d.pace&&d.pace.rolling_min_per_eqkm)s+=`<span>GAP pace <b>${d.pace.rolling_min_per_eqkm} min/km</b></span>`;
+    if(d.runner.stale_min>10)s+=`<span class="warn">⚠ No signal for ${Math.round(d.runner.stale_min)} min</span>`;
+  }else s+='<span>Waiting for first LiveTrack data …</span>';
   if(d.poll_error)s+=`<span class="warn">⚠ ${esc(d.poll_error)}</span>`;
   st.innerHTML=s;
 
@@ -934,7 +942,7 @@ async function refresh(){
   if(nextVp){nc.style.display='block';
     document.getElementById('n_name').textContent=`${nextVp.name} · km ${nextVp.km}`;
     document.getElementById('n_eta').textContent=fmtClock(nextVp.eta_epoch);
-    document.getElementById('n_cd').textContent=`${fmtCd(nextVp.eta_in_s)} · noch ${nextVp.remaining_km} km`;
+    document.getElementById('n_cd').textContent=`${fmtCd(nextVp.eta_in_s)} · ${nextVp.remaining_km} km to go`;
   }else nc.style.display='none';
   if(map&&d.runner){
     if(!runnerMarker)runnerMarker=L.marker([d.runner.lat,d.runner.lon],{icon:runnerIcon}).addTo(map);
@@ -947,10 +955,10 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh()}
 </script></body></html>"""
 
 # ---------- Admin ----------
-ADMIN_HTML = """<!doctype html><html lang="de"><head>
+ADMIN_HTML = """<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Crew-Tracking · Admin</title>
+<title>crew-eta · admin</title>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
 <style>""" + COMMON_CSS + """
 .trk{border-top:1px solid var(--line);padding:12px 2px}
@@ -963,28 +971,28 @@ ADMIN_HTML = """<!doctype html><html lang="de"><head>
 .trk .acts{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
 .edit{margin-top:10px;display:none}
 </style></head><body>
-<header><h1><a href="/tracking/">Crew-Tracking</a> · Admin</h1></header>
+<header><h1><a href="/tracking/">crew-eta</a> · admin</h1></header>
 <div class="wrap">
   <div class="card">
-    <h2 style="font-size:15px;margin-bottom:6px">Neuen Track anlegen</h2>
+    <h2 style="font-size:15px;margin-bottom:6px">Create a track</h2>
     <form id="create">
-      <label>Name (erscheint in der Liste)</label>
-      <input name="name" placeholder="z. B. GTCB Finestrat 102K" required>
-      <label>GPX-Strecke</label>
+      <label>Name (shown in the list)</label>
+      <input name="name" placeholder="e.g. GTCB Finestrat 102K" required>
+      <label>GPX route</label>
       <input type="file" name="gpx" accept=".gpx" required>
-      <label>Verpflegungspunkte — eine Zeile: Name, km</label>
+      <label>Aid stations — one per line: name, km</label>
       <textarea name="markers" placeholder="VP1, 12&#10;VP2, 33.3&#10;VP3, 58.5"></textarea>
       <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
         <input type="checkbox" name="simulate" value="1" style="width:auto">
-        Simulation (Testlauf ohne Garmin-Link)
+        Simulation (test run without a Garmin link)
       </label>
-      <button type="submit" style="margin-top:14px">Anlegen</button>
+      <button type="submit" style="margin-top:14px">Create</button>
       <div class="msg" id="cmsg"></div>
     </form>
   </div>
   <div class="card">
-    <h2 style="font-size:15px;margin-bottom:6px">Bestehende Tracks</h2>
-    <div id="list"><div class="dim">lade …</div></div>
+    <h2 style="font-size:15px;margin-bottom:6px">Existing tracks</h2>
+    <div id="list"><div class="dim">loading …</div></div>
   </div>
 </div>
 <script>
@@ -993,37 +1001,37 @@ function mkText(mks){return mks.map(m=>`${m.name}, ${m.km}`).join('\\n')}
 
 document.getElementById('create').addEventListener('submit',async e=>{
   e.preventDefault();const f=e.target,msg=document.getElementById('cmsg');
-  msg.textContent='Lade…';msg.className='msg';
+  msg.textContent='Loading…';msg.className='msg';
   const r=await fetch('/tracking/admin/api/create',{method:'POST',body:new FormData(f)});
-  const d=await r.json().catch(()=>({detail:'Serverfehler'}));
-  if(r.ok){msg.textContent=`Angelegt — ${d.total_km} km, ${d.markers.length} Marker`;
+  const d=await r.json().catch(()=>({detail:'Server error'}));
+  if(r.ok){msg.textContent=`Created — ${d.total_km} km, ${d.markers.length} markers`;
     msg.className='msg ok';f.reset();load()}
-  else{msg.textContent=d.detail||'Fehler';msg.className='msg err'}
+  else{msg.textContent=d.detail||'Error';msg.className='msg err'}
 });
 
 async function load(){
   let d;try{d=await(await fetch('/tracking/admin/api/tracks')).json()}catch{return}
   const box=document.getElementById('list');
-  if(!d.tracks.length){box.innerHTML='<div class="dim">Noch keine Tracks.</div>';return}
+  if(!d.tracks.length){box.innerHTML='<div class="dim">No tracks yet.</div>';return}
   box.innerHTML='';
   for(const t of d.tracks){
     const el=document.createElement('div');el.className='trk';
     const tag=t.simulate?'<span class="tag">SIM</span>':
-      (t.has_link?'<span class="tag ok">Link aktiv</span>':'<span class="tag warn">wartet auf Link</span>');
+      (t.has_link?'<span class="tag ok">link active</span>':'<span class="tag warn">waiting for link</span>');
     el.innerHTML=`
       <h3>${esc(t.name)} ${tag}</h3>
-      <div class="meta">${t.total_km} km · ${t.markers.length} Marker · <a href="/tracking/t/${t.id}">öffnen</a></div>
+      <div class="meta">${t.total_km} km · ${t.markers.length} markers · <a href="/tracking/t/${t.id}">open</a></div>
       <div class="acts">
-        <button class="ghost" data-edit="${t.id}">Bearbeiten</button>
-        <button class="danger" data-del="${t.id}" data-name="${esc(t.name)}">Löschen</button>
+        <button class="ghost" data-edit="${t.id}">Edit</button>
+        <button class="danger" data-del="${t.id}" data-name="${esc(t.name)}">Delete</button>
       </div>
       <div class="edit" id="edit-${t.id}">
         <label>Name</label><input id="n-${t.id}" value="${esc(t.name)}">
-        <label>Marker</label><textarea id="m-${t.id}">${esc(mkText(t.markers))}</textarea>
-        <label>GPX ersetzen (optional)</label><input type="file" id="g-${t.id}" accept=".gpx">
+        <label>Markers</label><textarea id="m-${t.id}">${esc(mkText(t.markers))}</textarea>
+        <label>Replace GPX (optional)</label><input type="file" id="g-${t.id}" accept=".gpx">
         <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0">
           <input type="checkbox" id="s-${t.id}" ${t.simulate?'checked':''} style="width:auto"> Simulation</label>
-        <button data-save="${t.id}" style="margin-top:12px">Speichern</button>
+        <button data-save="${t.id}" style="margin-top:12px">Save</button>
         <div class="msg" id="em-${t.id}"></div>
       </div>`;
     box.appendChild(el);
@@ -1033,7 +1041,7 @@ async function load(){
     e.style.display=e.style.display==='block'?'none':'block'}));
   box.querySelectorAll('[data-del]').forEach(b=>b.addEventListener('click',async()=>{
     const id=b.getAttribute('data-del');
-    if(!confirm(`Track "${b.getAttribute('data-name')}" löschen?`))return;
+    if(!confirm(`Delete track "${b.getAttribute('data-name')}"?`))return;
     const fd=new FormData();fd.set('id',id);
     const r=await fetch('/tracking/admin/api/delete',{method:'POST',body:fd});
     if(r.ok)load()}));
@@ -1045,19 +1053,19 @@ async function load(){
     fd.set('markers',document.getElementById('m-'+id).value);
     if(document.getElementById('s-'+id).checked)fd.set('simulate','1');
     const gf=document.getElementById('g-'+id).files[0];if(gf)fd.set('gpx',gf);
-    msg.textContent='Lade…';msg.className='msg';
+    msg.textContent='Loading…';msg.className='msg';
     const r=await fetch('/tracking/admin/api/update',{method:'POST',body:fd});
-    const d=await r.json().catch(()=>({detail:'Serverfehler'}));
-    if(r.ok){msg.textContent='Gespeichert';msg.className='msg ok';load()}
-    else{msg.textContent=d.detail||'Fehler';msg.className='msg err'}
+    const d=await r.json().catch(()=>({detail:'Server error'}));
+    if(r.ok){msg.textContent='Saved';msg.className='msg ok';load()}
+    else{msg.textContent=d.detail||'Error';msg.className='msg err'}
   }));
 }
 load();
 </script></body></html>"""
 
-NOTFOUND_HTML = """<!doctype html><html lang="de"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Nicht gefunden</title>
+NOTFOUND_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Not found</title>
 <style>""" + COMMON_CSS + """.wrap{padding-top:60px;text-align:center}</style></head><body>
-<div class="wrap"><h1 style="font-size:20px;margin-bottom:10px">Track nicht gefunden</h1>
-<p class="dim">Er wurde evtl. im Admin-Bereich gelöscht.</p>
-<p style="margin-top:16px"><a href="/tracking/">← zur Übersicht</a></p></div></body></html>"""
+<div class="wrap"><h1 style="font-size:20px;margin-bottom:10px">Track not found</h1>
+<p class="dim">It may have been deleted in the admin area.</p>
+<p style="margin-top:16px"><a href="/tracking/">← back to overview</a></p></div></body></html>"""
