@@ -1,0 +1,19 @@
+# Laufzeitdaten (Tracks, GPX, Live-Punkte) — nie committen
+data/
+*.gpx
+!tests/*.gpx
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / Editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,15 @@
+services:
+  crew-eta:
+    build: .
+    container_name: crew-eta
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8010:8010"
+    volumes:
+      - ./data:/data
+    environment:
+      - POLL_INTERVAL=60
+      - ROLLING_WINDOW_MIN=30
+      - DRIFT_PER_HOUR=0.03
+      # WICHTIG: vor dem ersten Start aendern! Siehe .env / README.
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme-in-env}
