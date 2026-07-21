@@ -36,14 +36,43 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 ROLLING_WINDOW_MIN = float(os.environ.get("ROLLING_WINDOW_MIN", "30"))
 DRIFT_PER_HOUR = float(os.environ.get("DRIFT_PER_HOUR", "0.03"))
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "changeme-in-env")
+DEFAULT_ADMIN_PASSWORD = "changeme-in-env"
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
 OFFROUTE_MAX_M = 400.0
 MAX_TRACKPOINTS = 60000
+
+# Security / abuse limits
+MAX_ROUTE_POINTS = 200000          # cap parsed GPX route size (CPU/RAM DoS)
+MAX_GPX_BYTES = 10 * 1024 * 1024   # 10 MB upload cap
+MAX_NAME_LEN = 200
+MAX_MARKERS_LEN = 20000
+MAX_MARKERS = 1000
+MAX_LIVETRACK_LEN = 2000
+# Track ids are secrets.token_hex(4); accept only hex so ids can never
+# escape DATA_DIR when used to build file paths.
+_TID_RE = re.compile(r"[0-9a-fA-F]{6,64}\Z")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 META_FILE = DATA_DIR / "tracks.json"
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "img-src 'self' data: https://*.basemaps.cartocdn.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; "
+        "script-src 'self' 'unsafe-inline' https://unpkg.com; "
+        "font-src https://fonts.gstatic.com; "
+        "connect-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'"
+    )
+    return resp
 
 # STATE["tracks"][id] = {
 #   cfg: {id,name,markers,simulate,livetrack_url,session_id,token,created},
@@ -72,7 +101,21 @@ def grade_factor(g):
 
 
 def build_route(gpx_bytes):
-    gpx = gpxpy.parse(gpx_bytes.decode("utf-8", errors="replace"))
+    if len(gpx_bytes) > MAX_GPX_BYTES:
+        raise ValueError("GPX file too large")
+    text = gpx_bytes.decode("utf-8", errors="replace")
+    # Reject DOCTYPE / entity declarations: defends against XXE (local file
+    # disclosure via SYSTEM entities) and "billion laughs" expansion DoS,
+    # independent of the XML backend gpxpy uses.
+    low = text.lower()
+    if "<!doctype" in low or "<!entity" in low or "<!element" in low:
+        raise ValueError("GPX must not contain DOCTYPE or entity declarations")
+    try:
+        gpx = gpxpy.parse(text)
+    except ValueError:
+        raise
+    except Exception:  # noqa: BLE001 - gpxpy raises various XML/GPX errors
+        raise ValueError("File is not valid GPX")
     pts = []
     for trk in gpx.tracks:
         for seg in trk.segments:
@@ -82,6 +125,8 @@ def build_route(gpx_bytes):
             pts.extend(rte.points)
     if len(pts) < 2:
         raise ValueError("GPX contains no route")
+    if len(pts) > MAX_ROUTE_POINTS:
+        raise ValueError(f"GPX route too large (max {MAX_ROUTE_POINTS} points)")
 
     lat = [p.latitude for p in pts]
     lon = [p.longitude for p in pts]
@@ -356,12 +401,20 @@ def build_summary(tr):
 # ----------------------------------------------------------------------------
 # Persistence
 # ----------------------------------------------------------------------------
+def _check_tid(tid):
+    """Reject any track id that isn't a plain hex token, so it can never be
+    used to traverse outside DATA_DIR."""
+    if not isinstance(tid, str) or not _TID_RE.fullmatch(tid):
+        raise HTTPException(404, "Track not found")
+    return tid
+
+
 def gpx_path(tid):
-    return DATA_DIR / f"{tid}.gpx"
+    return DATA_DIR / f"{_check_tid(tid)}.gpx"
 
 
 def live_path(tid):
-    return DATA_DIR / f"{tid}.track.json"
+    return DATA_DIR / f"{_check_tid(tid)}.track.json"
 
 
 def save_meta():
@@ -439,7 +492,9 @@ async def poller():
                     save_live(tr)
             except Exception as e:  # noqa: BLE001
                 async with LOCK:
-                    tr["poll_error"] = str(e)
+                    # Keep it short and single-line; this value is served publicly.
+                    msg = (str(e) or e.__class__.__name__).splitlines()[0]
+                    tr["poll_error"] = msg[:200]
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -455,7 +510,12 @@ async def _startup():
 # ----------------------------------------------------------------------------
 # Auth (admin, HTTP Basic)
 # ----------------------------------------------------------------------------
-def require_admin(authorization: str = Header(None)):
+async def require_admin(authorization: str = Header(None)):
+    # Refuse to expose admin at all while the well-known default password is in
+    # place — forces operators to set a real ADMIN_PASSWORD before use.
+    if not ADMIN_PASSWORD or ADMIN_PASSWORD == DEFAULT_ADMIN_PASSWORD:
+        raise HTTPException(
+            503, detail="Admin disabled: set a strong ADMIN_PASSWORD env var")
     unauth = HTTPException(
         401, detail="Authentication required",
         headers={"WWW-Authenticate": 'Basic realm="crew-eta admin"'})
@@ -464,9 +524,11 @@ def require_admin(authorization: str = Header(None)):
     try:
         decoded = base64.b64decode(authorization.split(" ", 1)[1]).decode("utf-8")
     except Exception:  # noqa: BLE001
+        await asyncio.sleep(0.5)  # slow down credential guessing
         raise unauth
     pw = decoded.split(":", 1)[1] if ":" in decoded else decoded
     if not secrets.compare_digest(pw, ADMIN_PASSWORD):
+        await asyncio.sleep(0.5)  # slow down credential guessing
         raise unauth
     return True
 
@@ -495,10 +557,39 @@ def parse_markers(text):
         markers.append({"name": name.strip(), "km": km})
     if not markers:
         raise ValueError("No markers given")
+    if len(markers) > MAX_MARKERS:
+        raise ValueError(f"Too many markers (max {MAX_MARKERS})")
     return sorted(markers, key=lambda m: m["km"])
 
 
+_ALLOWED_GPX_CT = {"", "application/gpx+xml", "application/xml", "text/xml",
+                   "application/octet-stream", "text/plain"}
+
+
+async def read_gpx_upload(upload):
+    """Read an uploaded GPX safely: enforce extension, content-type and a hard
+    size cap while streaming so a huge upload can't exhaust memory."""
+    filename = upload.filename or ""
+    if not filename.lower().endswith(".gpx"):
+        raise HTTPException(400, "Only .gpx files are allowed")
+    if (upload.content_type or "").lower() not in _ALLOWED_GPX_CT:
+        raise HTTPException(400, "Unexpected content type for a GPX file")
+    data = bytearray()
+    while True:
+        chunk = await upload.read(65536)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > MAX_GPX_BYTES:
+            raise HTTPException(
+                413, f"GPX file too large (max {MAX_GPX_BYTES // (1024 * 1024)} MB)")
+    if not data:
+        raise HTTPException(400, "Empty GPX file")
+    return bytes(data)
+
+
 def get_track(tid):
+    _check_tid(tid)
     tr = STATE["tracks"].get(tid)
     if not tr:
         raise HTTPException(404, "Track not found")
@@ -519,8 +610,12 @@ async def admin_create(
     name = name.strip()
     if not name:
         raise HTTPException(400, "Name is required")
+    if len(name) > MAX_NAME_LEN:
+        raise HTTPException(400, "Name is too long")
+    if len(markers) > MAX_MARKERS_LEN:
+        raise HTTPException(400, "Markers text is too long")
     sim = simulate in ("1", "on", "true")
-    gpx_bytes = await gpx.read()
+    gpx_bytes = await read_gpx_upload(gpx)
     try:
         route = build_route(gpx_bytes)
         mks = parse_markers(markers)
@@ -552,6 +647,14 @@ async def admin_update(
     simulate: str = Form(""),
     gpx: UploadFile = File(None),
 ):
+    _check_tid(id)
+    if len(name) > MAX_NAME_LEN:
+        raise HTTPException(400, "Name is too long")
+    if len(markers) > MAX_MARKERS_LEN:
+        raise HTTPException(400, "Markers text is too long")
+    new_gpx = None
+    if gpx is not None and (gpx.filename or "").strip():
+        new_gpx = await read_gpx_upload(gpx)
     async with LOCK:
         tr = STATE["tracks"].get(id)
         if not tr:
@@ -563,9 +666,6 @@ async def admin_update(
         name = name.strip()
         if not name:
             raise HTTPException(400, "Name is required")
-        new_gpx = None
-        if gpx is not None:
-            new_gpx = await gpx.read()
         if new_gpx:
             try:
                 route = build_route(new_gpx)
@@ -591,6 +691,7 @@ async def admin_update(
 
 @app.post("/tracking/admin/api/delete")
 async def admin_delete(_ok: bool = Depends(require_admin), id: str = Form(...)):
+    _check_tid(id)
     async with LOCK:
         if id in STATE["tracks"]:
             del STATE["tracks"][id]
@@ -629,6 +730,9 @@ async def api_tracks():
 @app.post("/tracking/api/link")
 async def api_link(id: str = Form(...), livetrack: str = Form(...)):
     """Set/change the Garmin link — intentionally open (first visitor fills it)."""
+    _check_tid(id)
+    if len(livetrack) > MAX_LIVETRACK_LEN:
+        raise HTTPException(400, "LiveTrack link is too long")
     try:
         sid, tok = parse_livetrack_url(livetrack)
     except ValueError as e:
