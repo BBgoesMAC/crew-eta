@@ -22,6 +22,7 @@ import secrets
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import gpxpy
 import httpx
@@ -48,6 +49,7 @@ MAX_NAME_LEN = 200
 MAX_MARKERS_LEN = 20000
 MAX_MARKERS = 1000
 MAX_LIVETRACK_LEN = 2000
+_LIVETRACK_MAX_REDIRECTS = 6       # cap redirect hops when resolving gar.mn links
 # Track ids are secrets.token_hex(4); accept only hex so ids can never
 # escape DATA_DIR when used to build file paths.
 _TID_RE = re.compile(r"[0-9a-fA-F]{6,64}\Z")
@@ -204,6 +206,68 @@ def parse_livetrack_url(url):
         if mq:
             tok = mq.group(1)
     return sid, tok
+
+
+def _is_garmin_host(host):
+    """True only for Garmin-owned hosts we trust to resolve/fetch links from.
+
+    Guards the short-link resolver against SSRF: an attacker can point a link
+    anywhere, but we refuse to make requests to anything outside Garmin.
+    """
+    host = (host or "").lower()
+    return (host in ("gar.mn", "www.gar.mn")
+            or host == "garmin.com" or host.endswith(".garmin.com"))
+
+
+async def _follow_garmin_redirects(url):
+    """Follow HTTP redirects from a Garmin short link (gar.mn/...) until the
+    final livetrack.garmin.com/session/... URL is reached.
+
+    SSRF-safe: every hop must stay on a Garmin host, only http(s) is allowed,
+    redirects are capped and there is a short timeout.
+    """
+    headers = {"user-agent": "Mozilla/5.0 (crew-eta-dashboard)"}
+    current = url
+    async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+        for _ in range(_LIVETRACK_MAX_REDIRECTS):
+            p = urlparse(current)
+            if p.scheme not in ("http", "https") or not _is_garmin_host(p.hostname):
+                raise ValueError("Refusing to follow a non-Garmin redirect")
+            if (p.hostname or "").lower().endswith("livetrack.garmin.com") \
+                    and "/session/" in (p.path or ""):
+                return current
+            r = await client.get(current, headers=headers)
+            if r.status_code in (301, 302, 303, 307, 308):
+                loc = r.headers.get("location")
+                if not loc:
+                    raise ValueError(
+                        "LiveTrack short link redirected without a target")
+                current = urljoin(current, loc)
+                continue
+            # Not a redirect: trust the final resolved URL of the response.
+            return str(r.url)
+    raise ValueError("Too many redirects while resolving the LiveTrack link")
+
+
+async def resolve_livetrack(raw):
+    """Turn a pasted LiveTrack link into (session_id, token, canonical_url).
+
+    Accepts either a full livetrack.garmin.com/session/... URL (parsed with no
+    network call) or a Garmin short link such as https://gar.mn/XXXX, which is
+    resolved by following redirects within Garmin domains only.
+    """
+    p = urlparse(raw)
+    if not _is_garmin_host(p.hostname):
+        raise ValueError(
+            "Not a Garmin LiveTrack link "
+            "(expected livetrack.garmin.com/... or gar.mn/...)")
+    if (p.hostname or "").lower().endswith("livetrack.garmin.com") \
+            and "/session/" in (p.path or ""):
+        sid, tok = parse_livetrack_url(raw)
+        return sid, tok, raw
+    final = await _follow_garmin_redirects(raw)
+    sid, tok = parse_livetrack_url(final)
+    return sid, tok, final
 
 
 async def fetch_trackpoints(sid, tok):
@@ -734,15 +798,17 @@ async def api_link(id: str = Form(...), livetrack: str = Form(...)):
     if len(livetrack) > MAX_LIVETRACK_LEN:
         raise HTTPException(400, "LiveTrack link is too long")
     try:
-        sid, tok = parse_livetrack_url(livetrack)
+        sid, tok, canonical = await resolve_livetrack(livetrack)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except httpx.HTTPError:
+        raise HTTPException(502, "Could not reach Garmin to resolve the LiveTrack link")
     async with LOCK:
         tr = STATE["tracks"].get(id)
         if not tr:
             raise HTTPException(404, "Track not found")
         changed = tr["cfg"].get("session_id") != sid
-        tr["cfg"]["livetrack_url"] = livetrack
+        tr["cfg"]["livetrack_url"] = canonical
         tr["cfg"]["session_id"] = sid
         tr["cfg"]["token"] = tok
         if changed:  # different link -> reset live data
@@ -938,7 +1004,7 @@ tr.passed .nm::after{content:" ✓";color:var(--green)}
   <div id="needlink" class="card" style="display:none">
     <b>Garmin LiveTrack link missing.</b>
     <div class="dim" style="font-size:13px;margin-top:4px">Paste the link from Garmin (available once the activity has started) — tracking then runs automatically.</div>
-    <div class="linkrow"><input id="link1" placeholder="https://livetrack.garmin.com/session/…/token/…">
+    <div class="linkrow"><input id="link1" placeholder="https://gar.mn/… or livetrack.garmin.com/session/…">
       <button id="save1">Save</button></div>
     <div class="msg" id="msg1"></div>
   </div>
