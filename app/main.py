@@ -193,12 +193,14 @@ def project(route, lat, lon, last_idx):
 # LiveTrack
 # ----------------------------------------------------------------------------
 def parse_livetrack_url(url):
-    m = re.search(r"livetrack\.garmin\.com/session/([0-9a-fA-F-]+)", url)
+    # Grab whole path segments (stop at the next / ? #) so a session id or token
+    # is never silently truncated if Garmin changes their character set.
+    m = re.search(r"livetrack\.garmin\.com/session/([^/?#]+)", url)
     if not m:
         raise ValueError("Not a valid LiveTrack link (expected .../session/<id>/...)")
     sid = m.group(1)
     tok = None
-    mt = re.search(r"/token/([A-Za-z0-9_-]+)", url)
+    mt = re.search(r"/token/([^/?#]+)", url)
     if mt:
         tok = mt.group(1)
     else:
@@ -270,46 +272,50 @@ async def resolve_livetrack(raw):
     return sid, tok, final
 
 
-async def fetch_trackpoints(sid, tok):
-    ms = int(time.time() * 1000)
-    candidates = []
-    if tok:
-        candidates.append(
-            f"https://livetrack.garmin.com/services/session/{sid}/token/{tok}/trackpoints?requestTime={ms}")
-        candidates.append(
-            f"https://livetrack.garmin.com/services/session/{sid}/trackpoints?requestTime={ms}&token={tok}")
-    candidates.append(
-        f"https://livetrack.garmin.com/services/session/{sid}/trackpoints?requestTime={ms}")
+# Garmin's LiveTrack is now a Cloudflare-fronted SPA whose trackpoints API is
+# guarded by a double-submit CSRF token. We load the session page first (it sets
+# cookies and embeds <meta name="csrf-token" ...>), then call the API with that
+# token in the Livetrack-Csrf-Token header, reusing the page's cookies. Both the
+# cookies and the header are required; the User-Agent is not checked.
+_CSRF_RE = re.compile(r'name="csrf-token"\s+content="([^"]+)"')
 
-    headers = {"accept": "application/json",
-               "user-agent": "Mozilla/5.0 (crew-eta-dashboard)"}
-    last_err = None
-    async with httpx.AsyncClient(timeout=20) as client:
-        for url in candidates:
+
+async def fetch_trackpoints(sid, tok):
+    if not tok:
+        raise RuntimeError("LiveTrack token missing")
+    page_url = f"https://livetrack.garmin.com/session/{sid}/token/{tok}"
+    api_url = (f"https://livetrack.garmin.com/api/sessions/{sid}"
+               f"/track-points/common?token={tok}")
+    ua = {"user-agent": "Mozilla/5.0 (crew-eta-dashboard)"}
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        # 1) Load the session page: sets cookies + carries the CSRF token.
+        page = await client.get(page_url, headers=ua)
+        m = _CSRF_RE.search(page.text)
+        if not m:
+            raise RuntimeError(f"CSRF token not found (HTTP {page.status_code})")
+        csrf = m.group(1)
+        # 2) Fetch trackpoints with the CSRF header + the cookies just set.
+        r = await client.get(api_url, headers={**ua, "accept": "application/json",
+                                               "Livetrack-Csrf-Token": csrf})
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        tps = data.get("trackPoints") or data.get("trackpoints") or []
+        out = []
+        for tp in tps:
+            pos = tp.get("position") or {}
+            la, lo = pos.get("lat"), pos.get("lon")
+            ts = tp.get("dateTime") or tp.get("timestamp")
+            if la is None or lo is None or ts is None:
+                continue
             try:
-                r = await client.get(url, headers=headers)
-                if r.status_code == 200:
-                    data = r.json()
-                    tps = data.get("trackPoints") or data.get("trackpoints") or []
-                    out = []
-                    for tp in tps:
-                        pos = tp.get("position") or {}
-                        la, lo = pos.get("lat"), pos.get("lon")
-                        ts = tp.get("dateTime") or tp.get("timestamp")
-                        if la is None or lo is None or ts is None:
-                            continue
-                        try:
-                            t = datetime.fromisoformat(
-                                str(ts).replace("Z", "+00:00")).timestamp()
-                        except ValueError:
-                            continue
-                        out.append({"t": t, "lat": la, "lon": lo,
-                                    "ele": tp.get("altitude")})
-                    return out
-                last_err = f"HTTP {r.status_code}"
-            except Exception as e:  # noqa: BLE001
-                last_err = str(e)
-    raise RuntimeError(last_err or "LiveTrack unreachable")
+                t = datetime.fromisoformat(
+                    str(ts).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            out.append({"t": t, "lat": la, "lon": lo,
+                        "ele": tp.get("altitude")})
+        return out
 
 
 # ----------------------------------------------------------------------------
