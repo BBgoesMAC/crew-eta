@@ -41,6 +41,13 @@ DEFAULT_ADMIN_PASSWORD = "changeme-in-env"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
 OFFROUTE_MAX_M = 400.0
 MAX_TRACKPOINTS = 60000
+# Projection is progress-gated: between two fixes the runner may advance at most
+# this far along the route. Nearest-point-by-air-distance alone snaps to the
+# finish on loop courses (finish sits right next to the start), so a plausible
+# along-route speed cap plus a fixed slack keeps the projection honest.
+MAX_ALONG_SPEED = 8.0       # m/s (~28.8 km/h) — above any trail runner incl. fast downhills
+FWD_SLACK_M = 400.0         # extra forward allowance per fix (sparse/late points)
+BACK_SLACK_M = 150.0        # allow a small backward correction (GPS jitter / switchbacks)
 
 # Security / abuse limits
 MAX_ROUTE_POINTS = 200000          # cap parsed GPX route size (CPU/RAM DoS)
@@ -167,26 +174,56 @@ def idx_at_km(route, km):
     return lo
 
 
-def project(route, lat, lon, last_idx):
-    """Project a position onto the route. Searches forward from the last known
-    index so crossings/switchbacks don't snap backwards."""
-    n = len(route["lat"])
-    start = max(0, last_idx - 150)
-    end = min(n, last_idx + 4000)
+def _nearest_in_range(route, lat, lon, lo, hi):
+    """Index of the closest route point in [lo, hi), with its distance."""
     best_i, best_d = None, 1e18
-    for i in range(start, end):
+    for i in range(lo, hi):
         d = haversine(lat, lon, route["lat"][i], route["lon"][i])
         if d < best_d:
             best_d, best_i = d, i
-    if best_d > OFFROUTE_MAX_M:
-        # global fallback search (e.g. restart mid-race)
-        for i in range(0, n, 5):
+    return best_i, best_d
+
+
+def project(route, lat, lon, last_idx, dt):
+    """Project a position onto the route, constrained by the distance the runner
+    can plausibly have covered — not just air-line proximity.
+
+    ``dt`` is the seconds since the last accepted fix, or ``None`` for the very
+    first fix. Pure nearest-neighbour snapping fails on any course that runs
+    close to itself (loops, out-and-back, a finish chute beside the start): the
+    geometrically nearest point may be hundreds of metres further along, so the
+    runner would teleport — typically straight to the finish. We therefore only
+    consider points within a window that starts a touch behind the current
+    progress and reaches forward as far as ``MAX_ALONG_SPEED * dt`` allows.
+
+    Returns the new route index (never far ahead of real progress) or ``None``
+    when the point is off-route / implausible, in which case the caller keeps
+    the previous progress and the point is treated as a gap.
+    """
+    cum = route["cum"]
+    n = len(cum)
+    if dt is None:
+        # First fix: bind to the EARLIEST on-route point, not the nearest. On a
+        # loop the finish is metres from the start; earliest keeps us at km 0.
+        best_i, best_d = None, 1e18
+        for i in range(n):
             d = haversine(lat, lon, route["lat"][i], route["lon"][i])
             if d < best_d:
                 best_d, best_i = d, i
-        if best_d > OFFROUTE_MAX_M:
+                if best_d <= OFFROUTE_MAX_M:
+                    break  # first point inside the corridor wins -> earliest
+        if best_i is None or best_d > OFFROUTE_MAX_M:
             return None
-    return max(best_i, last_idx)  # keep progress monotonic
+        return best_i
+    # Subsequent fixes: search only the reachable band around current progress.
+    cur_m = cum[last_idx]
+    fwd = MAX_ALONG_SPEED * max(dt, 0.0) + FWD_SLACK_M
+    lo = idx_at_km(route, max(0.0, cur_m - BACK_SLACK_M) / 1000.0)
+    hi = min(n, idx_at_km(route, (cur_m + fwd) / 1000.0) + 1)
+    best_i, best_d = _nearest_in_range(route, lat, lon, lo, hi)
+    if best_i is None or best_d > OFFROUTE_MAX_M:
+        return None  # off-route / gap: keep previous progress, retry next fix
+    return best_i
 
 
 # ----------------------------------------------------------------------------
@@ -343,7 +380,11 @@ def ingest_points(tr, points):
     route = tr["route"]
     for p in added:
         tr["track"].append(p)
-        idx = project(route, p["lat"], p["lon"], tr["last_idx"])
+        # dt is measured against the last ACCEPTED fix; None for the first one.
+        # A skipped (off-route) point widens dt for the next, so the reachable
+        # band grows and tracking re-acquires after a signal gap on its own.
+        dt = (p["t"] - tr["history"][-1][0]) if tr["history"] else None
+        idx = project(route, p["lat"], p["lon"], tr["last_idx"], dt)
         if idx is not None:
             tr["last_idx"] = idx
             tr["history"].append((p["t"], idx))
