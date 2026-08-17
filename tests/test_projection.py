@@ -115,8 +115,88 @@ def test_far_vp_not_ticked_at_a_self_crossing():
         "(ticked early at the crossing)")
 
 
+def _switchback(spacing_m=20.0, legs=8, leg_m=300, seed_step=6):
+    """Boustrophedon of parallel legs `spacing_m` apart, alternating direction."""
+    coords, y, e = [], 0.0, 300.0
+    for leg in range(legs):
+        xs = range(0, leg_m, seed_step) if leg % 2 == 0 else range(leg_m, -1, -seed_step)
+        for x in xs:
+            coords.append((LAT0 + y * M2LAT, LON0 + x * M2LON, e))
+            e += 1.0
+        y += spacing_m
+    return main.build_route(_gpx(coords))
+
+
+def _overlap_spur():
+    """Straight line with an out-and-back spur retracing the SAME line."""
+    coords, e = [], 300.0
+    for x in range(0, 1000, 5):
+        coords.append((LAT0, LON0 + x * M2LON, e)); e += 0.5
+    for yy in range(0, 300, 5):
+        coords.append((LAT0 + yy * M2LAT, LON0 + 1000 * M2LON, e)); e += 0.5
+    for yy in range(300, -1, -5):
+        coords.append((LAT0 + yy * M2LAT, LON0 + 1000 * M2LON, e)); e -= 0.5
+    for x in range(1000, 2000, 5):
+        coords.append((LAT0, LON0 + x * M2LON, e)); e += 0.5
+    return main.build_route(_gpx(coords))
+
+
+def _run(route, scatter_m, seed=4, dt=30, drop=frozenset()):
+    """Walk the route with GPS scatter; return max/avg along-route deviation."""
+    import random
+    rng = random.Random(seed)
+    cfg = {"id": "0a0a0a", "name": "r", "markers": [], "simulate": False,
+           "session_id": "x", "token": "y", "created": 0}
+    tr = main.new_track(cfg, route)
+    t, mx, tot, n = 1000.0, 0.0, 0.0, 0
+    for i in range(len(route["lat"])):
+        t += dt
+        if i in drop:
+            continue  # simulated signal gap
+        la = route["lat"][i] + rng.uniform(-scatter_m, scatter_m) * M2LAT
+        lo = route["lon"][i] + rng.uniform(-scatter_m, scatter_m) * M2LON
+        main.ingest_points(tr, [{"t": t, "lat": la, "lon": lo, "ele": route["ele"][i]}])
+        dev = abs(route["cum"][tr["last_idx"]] - route["cum"][i])
+        mx = max(mx, dev); tot += dev; n += 1
+    return mx, tot / n, tr
+
+
+def test_switchbacks_track_cleanly():
+    # The heading logic must not fling the projection onto a parallel leg in the
+    # zig-zag of a climb. Average error stays a few metres; worst case bounded.
+    route = _switchback()
+    mx, avg, _ = _run(route, scatter_m=5)
+    assert avg < 10, f"switchback average deviation too high: {avg:.1f} m"
+    assert mx < 120, f"switchback worst deviation too high: {mx:.1f} m"
+
+
+def test_direction_keeps_correct_leg_on_overlapping_spur():
+    # Out-and-back on the same line: without the heading tie-break the projection
+    # jumps onto the co-located return leg (hundreds of m). With it, it tracks.
+    route = _overlap_spur()
+    mx, avg, _ = _run(route, scatter_m=6)
+    assert avg < 15, f"spur average deviation too high: {avg:.1f} m"
+    assert mx < 200, f"spur worst deviation too high: {mx:.1f} m"
+
+
+def test_reacquires_after_signal_dropout():
+    # Lose GPS across a stretch, then resume: the projection must recover on the
+    # correct forward leg (not snap backwards or to the finish) and finish.
+    route = _switchback()
+    n = len(route["lat"])
+    drop = frozenset(range(int(n * 0.4), int(n * 0.55)))
+    mx, avg, tr = _run(route, scatter_m=5, drop=drop)
+    final_km = route["cum"][tr["last_idx"]] / 1000.0
+    total_km = route["total_m"] / 1000.0
+    assert final_km > total_km - 0.2, "did not re-acquire and reach the finish"
+    assert mx < 200, f"re-acquisition overshoot too high: {mx:.1f} m"
+
+
 if __name__ == "__main__":
     test_start_does_not_snap_to_finish_on_a_loop()
     test_progress_is_monotonic_over_a_full_loop()
     test_far_vp_not_ticked_at_a_self_crossing()
+    test_switchbacks_track_cleanly()
+    test_direction_keeps_correct_leg_on_overlapping_spur()
+    test_reacquires_after_signal_dropout()
     print("all projection regression tests passed")
