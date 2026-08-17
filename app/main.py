@@ -48,6 +48,32 @@ MAX_TRACKPOINTS = 60000
 MAX_ALONG_SPEED = 8.0       # m/s (~28.8 km/h) — above any trail runner incl. fast downhills
 FWD_SLACK_M = 400.0         # extra forward allowance per fix (sparse/late points)
 BACK_SLACK_M = 150.0        # allow a small backward correction (GPS jitter / switchbacks)
+# Where the route runs over itself (a crossing, an out-and-back sharing a
+# trail), two very different route positions sit on the same spot but point in
+# different directions. We disambiguate with the runner's heading, taken from
+# recent GPS fixes: when the nearest point runs against the runner but an almost
+# co-located point runs with them, we take the aligned one. Distance still leads;
+# heading only breaks the tie, so ordinary trail and switchbacks are untouched.
+DIR_COLOC_M = 8.0           # two legs within this are literally "the same spot" (a real
+                            # overlap); switchback legs are metres apart and stay unaffected
+DIR_MAX_DIFF = math.pi / 2  # a leg pointing >90° off the runner's heading is "wrong way"
+# The heading is smoothed over a baseline of recent travel, NOT a single step:
+# on short legs a per-fix bearing is mostly GPS noise and would fight the very
+# leg the runner is on. We look back until the runner has moved this far, so the
+# signal (real displacement) dominates the scatter.
+HEADING_BASELINE_M = 45.0
+RECENT_GPS_MAX = 40         # how many accepted coords to retain for that lookback
+# Hard safety cap on the heading override: it may only re-seat the projection
+# onto an overlapping leg within this along-route distance of the current
+# progress — i.e. still "where the runner plausibly is". This is what makes the
+# direction logic incapable of ever flinging the projection to a far leg (the
+# failure mode a naive heading check causes in switchback corners).
+OVERRIDE_MAX_M = 200.0
+# After a GPS/Internet dropout in the mountains the next fix arrives with a long
+# dt, so the reachable band would balloon and could snap to a far, unrelated leg
+# purely by proximity. Cap how far a *single* re-acquisition may jump forward;
+# with the heading check this keeps re-connects on the correct leg.
+REACQUIRE_MAX_M = 3000.0    # max forward jump on one fix after a long gap
 
 # Security / abuse limits
 MAX_ROUTE_POINTS = 200000          # cap parsed GPX route size (CPU/RAM DoS)
@@ -75,7 +101,11 @@ async def _security_headers(request, call_next):
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "img-src 'self' data: https://*.basemaps.cartocdn.com; "
+        # Map tiles: Esri World Imagery (satellite + labels hybrid, key-less) and
+        # Google hybrid, plus the CARTO dark basemap as a night option.
+        "img-src 'self' data: https://unpkg.com https://*.basemaps.cartocdn.com "
+        "https://server.arcgisonline.com https://*.arcgisonline.com "
+        "https://*.google.com https://*.googleapis.com https://*.ggpht.com; "
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; "
         "script-src 'self' 'unsafe-inline' https://unpkg.com; "
         "font-src https://fonts.gstatic.com; "
@@ -99,6 +129,39 @@ def haversine(lat1, lon1, lat2, lon2):
     dl = math.radians(lon2 - lon1)
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
+
+
+def bearing(lat1, lon1, lat2, lon2):
+    """Compass bearing in radians from point 1 to point 2 (0 = north)."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return math.atan2(y, x)
+
+
+def route_bearing(route, i):
+    """Direction the route heads at index i (radians)."""
+    n = len(route["lat"])
+    a = max(0, i - 1)
+    b = min(n - 1, i + 1)
+    if a == b:
+        return 0.0
+    return bearing(route["lat"][a], route["lon"][a],
+                   route["lat"][b], route["lon"][b])
+
+
+def smoothed_heading(recent, lat, lon):
+    """Runner bearing (radians) from recent GPS coords, or ``None`` if unknown.
+
+    ``recent`` is the tail of accepted (lat, lon) fixes, oldest first. We step
+    back through it until the runner has moved at least ``HEADING_BASELINE_M``,
+    so the heading reflects real travel rather than the jitter of one fix. A
+    runner who has barely moved yields ``None`` (direction stays as it was)."""
+    for rlat, rlon in reversed(recent):
+        if haversine(rlat, rlon, lat, lon) >= HEADING_BASELINE_M:
+            return bearing(rlat, rlon, lat, lon)
+    return None
 
 
 def grade_factor(g):
@@ -174,27 +237,68 @@ def idx_at_km(route, km):
     return lo
 
 
-def _nearest_in_range(route, lat, lon, lo, hi):
-    """Index of the closest route point in [lo, hi), with its distance."""
-    best_i, best_d = None, 1e18
+def _angle_diff(a, b):
+    """Smallest absolute difference between two bearings (radians), 0..pi."""
+    d = abs(a - b) % (2 * math.pi)
+    return d if d <= math.pi else 2 * math.pi - d
+
+
+def _best_in_range(route, lat, lon, lo, hi, heading, cur_m):
+    """Pick the on-route point in [lo, hi) that best matches the fix.
+
+    Distance decides by default: the result is the nearest on-route point, which
+    is correct for ordinary trail, switchbacks and loops alike, and can never run
+    away from the runner. Heading intervenes only in one specific situation — the
+    nearest point runs *against* the runner while an essentially co-located point
+    (within DIR_COLOC_M) runs *with* them. That is precisely a crossing or an
+    overlapping out-and-back, where two route positions share the same spot but
+    opposite directions; there we take the aligned one. Two guards keep this from
+    ever misfiring: the co-location cap (legs a switchback apart are not "the
+    same spot"), and OVERRIDE_MAX_M — the aligned point must still be near the
+    current progress ``cur_m``, so the override can never fling the projection to
+    a distant leg. Returns (index, distance) or (None, inf).
+    """
+    cands = []
+    d_min, i_min = 1e18, None
     for i in range(lo, hi):
         d = haversine(lat, lon, route["lat"][i], route["lon"][i])
-        if d < best_d:
+        if d <= OFFROUTE_MAX_M:
+            cands.append((d, i))
+            if d < d_min:
+                d_min, i_min = d, i
+    if i_min is None:
+        return None, 1e18
+    if heading is None:
+        return i_min, d_min
+    if _angle_diff(route_bearing(route, i_min), heading) <= DIR_MAX_DIFF:
+        return i_min, d_min  # nearest already goes the runner's way — keep it
+    # Nearest runs against us: prefer an aligned point on the same spot that is
+    # still a plausible step from where the runner already was.
+    cum = route["cum"]
+    best_i, best_d = None, 1e18
+    for d, i in cands:
+        if d <= d_min + DIR_COLOC_M \
+                and abs(cum[i] - cur_m) <= OVERRIDE_MAX_M \
+                and _angle_diff(route_bearing(route, i), heading) <= DIR_MAX_DIFF \
+                and d < best_d:
             best_d, best_i = d, i
-    return best_i, best_d
+    return (best_i, best_d) if best_i is not None else (i_min, d_min)
 
 
-def project(route, lat, lon, last_idx, dt):
+def project(route, lat, lon, last_idx, dt, heading=None):
     """Project a position onto the route, constrained by the distance the runner
-    can plausibly have covered — not just air-line proximity.
+    can plausibly have covered AND the direction they are travelling — not just
+    air-line proximity.
 
-    ``dt`` is the seconds since the last accepted fix, or ``None`` for the very
-    first fix. Pure nearest-neighbour snapping fails on any course that runs
-    close to itself (loops, out-and-back, a finish chute beside the start): the
-    geometrically nearest point may be hundreds of metres further along, so the
-    runner would teleport — typically straight to the finish. We therefore only
-    consider points within a window that starts a touch behind the current
-    progress and reaches forward as far as ``MAX_ALONG_SPEED * dt`` allows.
+    ``dt`` is the seconds since the last accepted fix (``None`` for the very
+    first one); ``heading`` is the runner's recent bearing in radians, or
+    ``None`` when unknown. Pure nearest-neighbour snapping fails wherever the
+    course runs close to itself: on a loop the finish sits beside the start, and
+    at a crossing / out-and-back the nearest point may belong to the *opposite*
+    leg — so the runner teleports to the finish or appears to run backwards. We
+    therefore search only a window that starts just behind the current progress
+    and reaches forward as far as speed*dt allows, and inside it prefer the leg
+    whose direction matches the runner's heading.
 
     Returns the new route index (never far ahead of real progress) or ``None``
     when the point is off-route / implausible, in which case the caller keeps
@@ -216,11 +320,14 @@ def project(route, lat, lon, last_idx, dt):
             return None
         return best_i
     # Subsequent fixes: search only the reachable band around current progress.
+    # A long gap (mountains) widens the band, but the single-fix forward jump is
+    # capped so a re-connect can't leap across the map; the heading check then
+    # keeps it on the correct leg.
     cur_m = cum[last_idx]
-    fwd = MAX_ALONG_SPEED * max(dt, 0.0) + FWD_SLACK_M
+    fwd = min(MAX_ALONG_SPEED * max(dt, 0.0) + FWD_SLACK_M, REACQUIRE_MAX_M)
     lo = idx_at_km(route, max(0.0, cur_m - BACK_SLACK_M) / 1000.0)
     hi = min(n, idx_at_km(route, (cur_m + fwd) / 1000.0) + 1)
-    best_i, best_d = _nearest_in_range(route, lat, lon, lo, hi)
+    best_i, best_d = _best_in_range(route, lat, lon, lo, hi, heading, cur_m)
     if best_i is None or best_d > OFFROUTE_MAX_M:
         return None  # off-route / gap: keep previous progress, retry next fix
     return best_i
@@ -360,7 +467,11 @@ async def fetch_trackpoints(sid, tok):
 # ----------------------------------------------------------------------------
 def new_track(cfg, route):
     return {"cfg": cfg, "route": route, "track": [], "history": [],
-            "last_idx": 0, "passed": {}, "poll_error": None, "last_poll_ok": None}
+            "last_idx": 0, "passed": {}, "poll_error": None, "last_poll_ok": None,
+            # recent accepted GPS coords + the smoothed heading derived from
+            # them, used to keep the projection on the correct leg at crossings,
+            # switchbacks and on re-connect after a signal gap.
+            "recent": [], "heading": None}
 
 
 def recompute_passed(tr):
@@ -384,10 +495,19 @@ def ingest_points(tr, points):
         # A skipped (off-route) point widens dt for the next, so the reachable
         # band grows and tracking re-acquires after a signal gap on its own.
         dt = (p["t"] - tr["history"][-1][0]) if tr["history"] else None
-        idx = project(route, p["lat"], p["lon"], tr["last_idx"], dt)
+        # Heading smoothed over recent travel; keep the last one while the
+        # runner is basically stationary so the direction can't spin on jitter.
+        heading = smoothed_heading(tr["recent"], p["lat"], p["lon"])
+        if heading is None:
+            heading = tr["heading"]
+        idx = project(route, p["lat"], p["lon"], tr["last_idx"], dt, heading)
         if idx is not None:
             tr["last_idx"] = idx
             tr["history"].append((p["t"], idx))
+            tr["heading"] = heading
+            tr["recent"].append((p["lat"], p["lon"]))
+            if len(tr["recent"]) > RECENT_GPS_MAX:
+                tr["recent"] = tr["recent"][-RECENT_GPS_MAX:]
     if len(tr["track"]) > MAX_TRACKPOINTS:
         tr["track"] = tr["track"][-MAX_TRACKPOINTS:]
     if tr["history"]:
@@ -950,6 +1070,18 @@ button.danger{background:#3a2226;color:var(--red)}
 .msg{margin-top:10px;font-size:14px}
 .msg.err{color:var(--red)}.msg.ok{color:var(--green)}
 .dim{color:var(--dim)}
+/* Pulsing runner beacon on the map */
+.runner-beacon{position:relative}
+.runner-beacon .core{position:absolute;left:50%;top:50%;width:16px;height:16px;
+  margin:-8px 0 0 -8px;border-radius:50%;background:#ff3b30;
+  border:3px solid #fff;box-shadow:0 0 8px 2px rgba(255,59,48,.9);z-index:2}
+.runner-beacon .pulse{position:absolute;left:50%;top:50%;width:16px;height:16px;
+  margin:-8px 0 0 -8px;border-radius:50%;background:rgba(255,59,48,.55);z-index:1;
+  animation:runnerPulse 1.5s ease-out infinite}
+.runner-beacon .pulse.d{animation-delay:.75s}
+@keyframes runnerPulse{0%{transform:scale(1);opacity:.8}
+  100%{transform:scale(4.5);opacity:0}}
+@media (prefers-reduced-motion:reduce){.runner-beacon .pulse{animation:none;opacity:0}}
 """
 
 # ---------- List ----------
@@ -1108,16 +1240,41 @@ async function initMap(){
   let r;try{r=await(await fetch('/tracking/api/route/'+TID)).json()}catch{return}
   if(!r.line)return;
   map=L.map('map',{zoomControl:true});
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    {attribution:'&copy; OpenStreetMap &copy; CARTO',maxZoom:18}).addTo(map);
-  const line=L.polyline(r.line,{color:'#f5a623',weight:3,opacity:.85}).addTo(map);
-  map.fitBounds(line.getBounds(),{padding:[20,20]});
+  // Satellite/terrain you can actually read: imagery with roads, place names,
+  // forests and buildings — like Google's hybrid view. Esri World Imagery +
+  // reference labels needs no API key; a Google hybrid layer and the dark
+  // street map are offered in the layer switcher (top-right).
+  const esriSat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    {attribution:'&copy; Esri, Maxar, Earthstar Geographics',maxZoom:19});
+  const esriLabels=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:19});
+  const esriRoads=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}',
+    {maxZoom:19});
+  const hybrid=L.layerGroup([esriSat,esriRoads,esriLabels]);
+  const google=L.tileLayer('https://mt{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+    {subdomains:['0','1','2','3'],attribution:'&copy; Google',maxZoom:20});
+  const dark=L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    {attribution:'&copy; OpenStreetMap &copy; CARTO',maxZoom:18});
+  hybrid.addTo(map);
+  L.control.layers({'Satellite (hybrid)':hybrid,'Google hybrid':google,'Dark street':dark},
+    null,{position:'topright'}).addTo(map);
+  // Draw a dark halo first, then the bright route on top, so the line stays
+  // legible over imagery (drawing order = stacking; no bringToBack, which throws
+  // before the map has a view).
+  L.polyline(r.line,{color:'#000',weight:7,opacity:.35}).addTo(map);
+  const line=L.polyline(r.line,{color:'#ffd21e',weight:4,opacity:.95}).addTo(map);
+  const fit=()=>map.fitBounds(line.getBounds(),{padding:[20,20],maxZoom:16});
+  fit();
+  // On mobile the container is often sized a tick after we build the map, which
+  // would otherwise leave it zoomed to a corner — re-measure and re-fit once.
+  setTimeout(()=>{try{map.invalidateSize();fit()}catch(e){}},250);
   vpLayer=L.layerGroup().addTo(map);mapReady=true;
 }
-function vpIcon(p){return L.divIcon({className:'',iconSize:[14,14],
-  html:`<div style="width:12px;height:12px;border-radius:50%;border:2px solid ${p?'#59c27a':'#e8e4da'};background:${p?'#59c27a':'#101418'}"></div>`})}
-const runnerIcon=L.divIcon({className:'',iconSize:[18,18],
-  html:'<div style="width:16px;height:16px;border-radius:50%;background:#f5a623;border:3px solid #101418;box-shadow:0 0 10px #f5a623"></div>'});
+function vpIcon(p){return L.divIcon({className:'',iconSize:[16,16],
+  html:`<div style="width:12px;height:12px;border-radius:50%;border:2px solid #000;box-shadow:0 0 0 1px ${p?'#59c27a':'#fff'};background:${p?'#59c27a':'#fff'}"></div>`})}
+// Runner: a loud, pulsing beacon so the eye locks onto it instantly.
+const runnerIcon=L.divIcon({className:'runner-beacon',iconSize:[28,28],iconAnchor:[14,14],
+  html:'<span class="pulse"></span><span class="pulse d"></span><span class="core"></span>'});
 
 async function refresh(){
   let d;try{const rr=await fetch('/tracking/api/status/'+TID);if(rr.status===404){document.getElementById('hdr').textContent='Track not found';return}d=await rr.json()}catch{return}

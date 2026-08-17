@@ -26,7 +26,7 @@ In short: a private community tool, at your own risk — not a product.
 - **The crew enters the Garmin link itself:** a newly created track has no LiveTrack link yet (it only exists once the activity has started). On the overview, the first visitor pastes it — after that, tracking runs automatically for everyone. A button lets anyone fix a wrong link.
 - **Grade-adjusted ETA** (GAP): uphill/downhill feed into the remaining time via a Minetti-style factor.
 - **Adaptive:** a blend of a rolling pace window and overall race pace, plus a small fatigue drift — the closer a point, the sharper its ETA.
-- **Dark map** (night-friendly for long races); aid-station markers turn green once passed.
+- **Satellite/hybrid map** (readable terrain — imagery with roads, place names, forests and buildings; switchable to a dark night map); the runner shows as a bright pulsing beacon and aid-station markers turn green once passed.
 - **Simulation mode** for testing without a real Garmin link.
 
 ## Tech
