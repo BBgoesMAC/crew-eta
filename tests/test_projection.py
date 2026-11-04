@@ -178,7 +178,6 @@ def test_direction_keeps_correct_leg_on_overlapping_spur():
     assert avg < 15, f"spur average deviation too high: {avg:.1f} m"
     assert mx < 200, f"spur worst deviation too high: {mx:.1f} m"
 
-
 def test_reacquires_after_signal_dropout():
     # Lose GPS across a stretch, then resume: the projection must recover on the
     # correct forward leg (not snap backwards or to the finish) and finish.
@@ -190,6 +189,28 @@ def test_reacquires_after_signal_dropout():
     total_km = route["total_m"] / 1000.0
     assert final_km > total_km - 0.2, "did not re-acquire and reach the finish"
     assert mx < 200, f"re-acquisition overshoot too high: {mx:.1f} m"
+    
+def _long_trail(km=15.0, step_m=10):
+    """A long, gently winding single trail (no overlaps), ~``km`` long."""
+    coords, e = [], 300.0
+    n = int(km * 1000 / step_m)
+    for k in range(n + 1):
+        y = k * step_m
+        x = 150 * math.sin(y / 700.0)
+        coords.append((LAT0 + y * M2LAT, LON0 + x * M2LON, e))
+        e += 0.3 * math.sin(y / 300.0)
+    return main.build_route(_gpx(coords))
+
+def test_reacquires_after_long_dropout_beyond_fixed_cap():
+    # ~1 h dead zone, runner covers ~5 km without a fix (> REACQUIRE_MAX_M).
+    route = _long_trail()
+    n = len(route["lat"])
+    drop = frozenset(range(int(n * 0.30), int(n * 0.30) + 500))
+    mx, avg, tr = _run(route, scatter_m=5, dt=7, drop=drop)
+    final_km = route["cum"][tr["last_idx"]] / 1000.0
+    total_km = route["total_m"] / 1000.0
+    assert final_km > total_km - 0.2, (
+        f"stuck at km {final_km:.1f} of {total_km:.1f} after a long dropout")
 
 
 if __name__ == "__main__":
