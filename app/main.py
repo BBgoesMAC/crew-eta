@@ -74,7 +74,7 @@ OVERRIDE_MAX_M = 200.0
 # purely by proximity. Cap how far a *single* re-acquisition may jump forward;
 # with the heading check this keeps re-connects on the correct leg.
 REACQUIRE_MAX_M = 3000.0    # max forward jump on one fix after a long gap
-
+REACQUIRE_SPEED = 3.0       # m/s: after long gaps the band grows with a realistic ultra speed
 # Security / abuse limits
 MAX_ROUTE_POINTS = 200000          # cap parsed GPX route size (CPU/RAM DoS)
 MAX_GPX_BYTES = 10 * 1024 * 1024   # 10 MB upload cap
@@ -324,7 +324,9 @@ def project(route, lat, lon, last_idx, dt, heading=None):
     # capped so a re-connect can't leap across the map; the heading check then
     # keeps it on the correct leg.
     cur_m = cum[last_idx]
-    fwd = min(MAX_ALONG_SPEED * max(dt, 0.0) + FWD_SLACK_M, REACQUIRE_MAX_M)
+    dt = max(dt, 0.0)
+    fwd = min(MAX_ALONG_SPEED * dt,
+              max(REACQUIRE_MAX_M, REACQUIRE_SPEED * dt)) + FWD_SLACK_M
     lo = idx_at_km(route, max(0.0, cur_m - BACK_SLACK_M) / 1000.0)
     hi = min(n, idx_at_km(route, (cur_m + fwd) / 1000.0) + 1)
     best_i, best_d = _best_in_range(route, lat, lon, lo, hi, heading, cur_m)
